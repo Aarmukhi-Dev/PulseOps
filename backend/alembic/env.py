@@ -8,7 +8,8 @@ from app.core.database import Base
 import app.models  # noqa: F401 — register every model on Base.metadata for Alembic.
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
+migration_database_url = settings.migration_database_url or settings.database_url
+config.set_main_option("sqlalchemy.url", migration_database_url.replace("%", "%%"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -34,6 +35,7 @@ def run_migrations_online() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={"connect_timeout": settings.database_connect_timeout_seconds},
     )
 
     with connectable.connect() as connection:

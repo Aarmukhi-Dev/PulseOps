@@ -28,8 +28,16 @@ export type ServiceInput = {
   timeout_seconds: number;
   expected_status_code: number | null;
   is_enabled: boolean;
-  created_by: string;
 };
+
+export type AuthUser = { id: string; email: string; display_name: string };
+let accessToken: string | null = null;
+let unauthorizedHandler: (() => void) | null = null;
+export function setAccessToken(token: string | null): void { accessToken = token; }
+export function setUnauthorizedHandler(handler: (() => void) | null): void { unauthorizedHandler = handler; }
+export async function login(email: string, password: string): Promise<{ access_token: string; user: AuthUser }> {
+  return request("/api/auth/login", { method: "POST", body: JSON.stringify({ email, password }) });
+}
 
 export type Metrics = {
   collected_at: string;
@@ -89,13 +97,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     response = await fetch(`${apiBaseUrl}${path}`, {
       ...init,
-      headers: { "Content-Type": "application/json", ...init?.headers },
+      headers: { "Content-Type": "application/json", ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}), ...init?.headers },
     });
   } catch {
     throw new ApiError("The PulseOps API could not be reached.", 0);
   }
 
   if (!response.ok) {
+    if (response.status === 401 && accessToken) unauthorizedHandler?.();
     let message = `Request failed (${response.status})`;
     try {
       const body = (await response.json()) as { detail?: unknown };

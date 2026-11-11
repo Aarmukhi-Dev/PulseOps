@@ -8,6 +8,9 @@ import {
   getMetrics,
   getServiceChecks,
   getServices,
+  login,
+  setAccessToken,
+  setUnauthorizedHandler,
   updateService,
   type Incident,
   type IncidentEvent,
@@ -36,6 +39,8 @@ const bytes = (value: number) => {
 
 export function App() {
   const [route, setRoute] = useState<AppRoute>(() => routeFromPath(window.location.pathname));
+  const [authenticated, setAuthenticated] = useState(false);
+  const [authError, setAuthError] = useState("");
   const navigate = useCallback((path: string) => {
     window.history.pushState({}, "", path);
     setRoute(routeFromPath(window.location.pathname));
@@ -49,16 +54,39 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    setUnauthorizedHandler(() => { setAccessToken(null); setAuthenticated(false); setAuthError("Your session expired. Please log in again."); });
+    return () => setUnauthorizedHandler(null);
+  }, []);
+
+  async function handleLogin(email: string, password: string) {
+    setAuthError("");
+    try {
+      const result = await login(email, password);
+      setAccessToken(result.access_token);
+      setAuthenticated(true);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Unable to log in.");
+    }
+  }
+
+  function handleLogout() {
+    setAccessToken(null);
+    setAuthenticated(false);
+    navigate("/dashboard");
+  }
+
+  useEffect(() => {
     if (route.kind !== "dashboard" || !window.location.hash) return;
     const frame = window.requestAnimationFrame(() => document.getElementById(window.location.hash.slice(1))?.scrollIntoView({ behavior: "smooth" }));
     return () => window.cancelAnimationFrame(frame);
   }, [route]);
 
   if (route.kind === "landing") return <LandingPage onNavigate={navigate} />;
-  return <DashboardApp initialPage={route.page} onNavigate={navigate} />;
+  if (!authenticated) return <LoginPage error={authError} onLogin={handleLogin} onBack={() => navigate("/")} />;
+  return <DashboardApp initialPage={route.page} onNavigate={navigate} onLogout={handleLogout} />;
 }
 
-function DashboardApp({ initialPage, onNavigate }: { initialPage: Page; onNavigate: (path: string) => void }) {
+function DashboardApp({ initialPage, onNavigate, onLogout }: { initialPage: Page; onNavigate: (path: string) => void; onLogout: () => void }) {
   const [page, setPage] = useState<Page>(initialPage);
   const [services, setServices] = useState<Service[]>([]);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
@@ -137,7 +165,6 @@ function DashboardApp({ initialPage, onNavigate }: { initialPage: Page; onNaviga
       timeout_seconds: Number(data.get("timeout")),
       expected_status_code: data.get("check_type") === "http" ? Number(data.get("expected_status") || 200) : null,
       is_enabled: true,
-      created_by: String(data.get("created_by")).trim(),
     };
     setSaving(true);
     try {
@@ -190,7 +217,7 @@ function DashboardApp({ initialPage, onNavigate }: { initialPage: Page; onNaviga
       <main className="main-area">
         <header className="topbar">
           <div className="breadcrumbs"><button className="mobile-menu-toggle" aria-label={mobileNavOpen ? "Close navigation" : "Open navigation"} aria-expanded={mobileNavOpen} onClick={() => setMobileNavOpen((open) => !open)}>{mobileNavOpen ? "×" : "☰"}</button><span>Workspace</span><span className="crumb-sep">/</span><strong>{page === "overview" ? "Overview" : page === "services" ? "Services" : "Incidents"}</strong></div>
-          <div className="top-actions"><span className={`live-indicator ${apiConnected ? "connected" : "disconnected"}`}><i /> {apiConnected ? "Live data" : "API offline"}</span><button className="icon-button" aria-label="Refresh data" onClick={() => void refresh()}>↻</button><div className="avatar">PO</div></div>
+          <div className="top-actions"><span className={`live-indicator ${apiConnected ? "connected" : "disconnected"}`}><i /> {apiConnected ? "Live data" : "API offline"}</span><button className="icon-button" aria-label="Refresh data" onClick={() => void refresh()}>↻</button><button className="text-button" onClick={onLogout}>Log out</button><div className="avatar">PO</div></div>
         </header>
         {notice && <div className={`notice ${notice.kind}`} role="status"><span>{notice.message}</span><button onClick={() => setNotice(null)} aria-label="Dismiss">×</button></div>}
 
@@ -228,9 +255,21 @@ function DashboardApp({ initialPage, onNavigate }: { initialPage: Page; onNaviga
         <footer className="footer"><span>PulseOps Operations Center</span><span>Data refreshes every 30 seconds · <time>{metrics ? localDate(metrics.collected_at) : "Metrics unavailable"}</time></span></footer>
       </main>
 
-      {modalOpen && <div className={`modal-backdrop ${modalClosing ? "closing" : ""}`} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeModal(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="add-service-title"><div className="modal-heading"><div><div className="eyebrow">NEW MONITOR</div><h2 id="add-service-title">Add a service</h2></div><button className="icon-button" onClick={closeModal} aria-label="Close">×</button></div><form onSubmit={(e) => void onCreate(e)}><label>Service name<input name="name" required maxLength={160} placeholder="Public API" /></label><label>Description <span className="optional">Optional</span><input name="description" placeholder="Production API endpoint" /></label><div className="form-row"><label>Check type<select name="check_type"><option value="http">HTTP / HTTPS</option><option value="tcp">TCP</option></select></label><label>Expected status<input name="expected_status" type="number" min="100" max="599" defaultValue="200" /></label></div><label>Target<input name="target" required placeholder="https://api.example.com/health or host:port" /></label><div className="form-row"><label>Interval (seconds)<input name="interval" type="number" required min="1" defaultValue="60" /></label><label>Timeout (seconds)<input name="timeout" type="number" required min="1" defaultValue="10" /></label></div><label>Created by user UUID<input name="created_by" required placeholder="UUID from local dev user command" /></label><p className="form-hint">The current API requires an existing user UUID. Create one with the backend local development user CLI.</p><div className="modal-actions"><button type="button" className="secondary-button" onClick={closeModal}>Cancel</button><button className="primary-button" disabled={saving}>{saving ? "Adding…" : "Add service"}</button></div></form></section></div>}
+      {modalOpen && <div className={`modal-backdrop ${modalClosing ? "closing" : ""}`} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeModal(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="add-service-title"><div className="modal-heading"><div><div className="eyebrow">NEW MONITOR</div><h2 id="add-service-title">Add a service</h2></div><button className="icon-button" onClick={closeModal} aria-label="Close">×</button></div><form onSubmit={(e) => void onCreate(e)}><label>Service name<input name="name" required maxLength={160} placeholder="Public API" /></label><label>Description <span className="optional">Optional</span><input name="description" placeholder="Production API endpoint" /></label><div className="form-row"><label>Check type<select name="check_type"><option value="http">HTTP / HTTPS</option><option value="tcp">TCP</option></select></label><label>Expected status<input name="expected_status" type="number" min="100" max="599" defaultValue="200" /></label></div><label>Target<input name="target" required placeholder="https://api.example.com/health or host:port" /></label><div className="form-row"><label>Interval (seconds)<input name="interval" type="number" required min="1" defaultValue="60" /></label><label>Timeout (seconds)<input name="timeout" type="number" required min="1" defaultValue="10" /></label></div><div className="modal-actions"><button type="button" className="secondary-button" onClick={closeModal}>Cancel</button><button className="primary-button" disabled={saving}>{saving ? "Adding…" : "Add service"}</button></div></form></section></div>}
     </div>
   );
+}
+
+function LoginPage({ error, onLogin, onBack }: { error: string; onLogin: (email: string, password: string) => Promise<void>; onBack: () => void }) {
+  const [busy, setBusy] = useState(false);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    setBusy(true);
+    try { await onLogin(String(data.get("email")), String(data.get("password"))); }
+    finally { setBusy(false); }
+  }
+  return <main className="auth-page"><section className="auth-card glass-panel"><a className="brand auth-brand" href="/" onClick={(event) => { event.preventDefault(); onBack(); }}><span className="brand-mark">P</span><span>pulse<span className="brand-light">ops</span><small>OPERATIONS CENTER</small></span></a><div className="eyebrow">SECURE WORKSPACE</div><h1>Welcome back</h1><p>Sign in to access your monitored services and incident history.</p><form onSubmit={(event) => void submit(event)}><label>Email<input name="email" type="email" autoComplete="username" maxLength={320} required /></label><label>Password<input name="password" type="password" autoComplete="current-password" maxLength={1024} required /></label>{error && <div className="auth-error" role="alert">{error}</div>}<button className="primary-button" disabled={busy}>{busy ? "Signing in…" : "Log in"}</button></form><button className="auth-back" onClick={onBack}>← Back to PulseOps</button></section></main>;
 }
 
 function StatCard({ label, value, sub, icon, tone }: { label: string; value: number; sub: string; icon: string; tone: string }) {

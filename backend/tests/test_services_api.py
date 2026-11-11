@@ -58,30 +58,35 @@ def create_payload(user_id: UUID, **overrides: object) -> dict[str, object]:
         "timeout_seconds": 5,
         "expected_status_code": 200,
         "is_enabled": True,
-        "created_by": str(user_id),
     }
     payload.update(overrides)
     return payload
 
 
+def get_user(test_db: sessionmaker, user_id: UUID) -> User:
+    with test_db() as db:
+        return db.get(User, user_id)
+
+
 def test_service_crud_endpoints(test_db: sessionmaker, service_api_user: UUID) -> None:
     with test_db() as db:
-        created = create_service(ServiceCreate.model_validate(create_payload(service_api_user)), db)
+        user = db.get(User, service_api_user)
+        created = create_service(ServiceCreate.model_validate(create_payload(service_api_user)), db, user)
         service_id = created.id
         assert ServiceRead.model_validate(created).name == "Payments API"
 
-        listed = list_services(db)
+        listed = list_services(db, user)
         assert any(service.id == service_id for service in listed)
-        assert get_service(service_id, db).target == "https://payments.example.test/health"
+        assert get_service(service_id, db, user).target == "https://payments.example.test/health"
 
-        updated = update_service(service_id, ServiceUpdate.model_validate({"name": "Payments production API", "description": None}), db)
+        updated = update_service(service_id, ServiceUpdate.model_validate({"name": "Payments production API", "description": None}), db, user)
         assert updated.name == "Payments production API"
         assert updated.description is None
 
-        deleted = delete_service(service_id, db)
+        deleted = delete_service(service_id, db, user)
         assert deleted.status_code == 204
         with pytest.raises(HTTPException) as error:
-            get_service(service_id, db)
+            get_service(service_id, db, user)
         assert error.value.status_code == 404
         assert error.value.detail == "Monitored service not found"
 
@@ -101,27 +106,67 @@ def test_service_crud_endpoints(test_db: sessionmaker, service_api_user: UUID) -
 def test_create_rejects_invalid_data(service_api_user: UUID, overrides: dict[str, object]) -> None:
     from pydantic import ValidationError
 
+    if "created_by" in overrides:
+        with pytest.raises(ValidationError):
+            ServiceCreate.model_validate(create_payload(service_api_user, **overrides))
+    else:
+        with pytest.raises(ValidationError):
+            ServiceCreate.model_validate(create_payload(service_api_user, **overrides))
+
+
+def test_client_cannot_choose_service_owner(service_api_user: UUID) -> None:
+    from pydantic import ValidationError
     with pytest.raises(ValidationError):
-        ServiceCreate.model_validate(create_payload(service_api_user, **overrides))
+        ServiceCreate.model_validate(create_payload(service_api_user, created_by=str(uuid4())))
 
 
-def test_create_requires_existing_creator(test_db: sessionmaker) -> None:
-    with test_db() as db, pytest.raises(HTTPException) as error:
-        create_service(ServiceCreate.model_validate(create_payload(uuid4())), db)
-    assert error.value.status_code == 422
-    assert error.value.detail == "created_by must reference an existing user"
+def test_service_records_are_isolated_by_owner(test_db: sessionmaker, service_api_user: UUID) -> None:
+    other_user_id = uuid4()
+    with test_db.begin() as db:
+        db.add(User(id=other_user_id, email="other-owner@example.test", display_name="Other", password_hash="$argon2id$fixture"))
+    with test_db() as db:
+        owner = db.get(User, service_api_user)
+        other = db.get(User, other_user_id)
+        service = create_service(ServiceCreate.model_validate(create_payload(service_api_user)), db, owner)
+        assert service.created_by == owner.id
+        assert list_services(db, other) == []
+        for action in (
+            lambda: get_service(service.id, db, other),
+            lambda: update_service(service.id, ServiceUpdate.model_validate({"name": "Hijacked"}), db, other),
+            lambda: delete_service(service.id, db, other),
+        ):
+            with pytest.raises(HTTPException) as error:
+                action()
+            assert error.value.status_code == 404
+
+
+def test_service_mutations_can_be_disabled_for_public_deployment(monkeypatch, service_api_user: UUID) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "service_mutations_enabled", False)
+    user = User(id=service_api_user, email="readonly@example.test", display_name="Readonly", password_hash="hash")
+    operations = (
+        lambda: create_service(ServiceCreate.model_validate(create_payload(service_api_user)), None, user),
+        lambda: update_service(uuid4(), ServiceUpdate.model_validate({"is_enabled": False}), None, user),
+        lambda: delete_service(uuid4(), None, user),
+    )
+    for operation in operations:
+        with pytest.raises(HTTPException) as error:
+            operation()
+        assert error.value.status_code == 503
 
 
 def test_patch_validates_updates(test_db: sessionmaker, service_api_user: UUID) -> None:
     from pydantic import ValidationError
 
     with test_db() as db:
-        service = create_service(ServiceCreate.model_validate(create_payload(service_api_user)), db)
+        user = db.get(User, service_api_user)
+        service = create_service(ServiceCreate.model_validate(create_payload(service_api_user)), db, user)
         for invalid in ({"name": " "}, {"name": None}, {"check_interval_seconds": 0}):
             with pytest.raises(ValidationError):
                 ServiceUpdate.model_validate(invalid)
         with pytest.raises(HTTPException) as error:
-            update_service(uuid4(), ServiceUpdate.model_validate({"name": "Missing"}), db)
+            update_service(uuid4(), ServiceUpdate.model_validate({"name": "Missing"}), db, user)
     assert error.value.status_code == 404
 
 
@@ -130,23 +175,23 @@ def test_missing_service_returns_404(test_db: sessionmaker, operation: str) -> N
     with test_db() as db, pytest.raises(HTTPException) as error:
         missing_id = uuid4()
         if operation == "get":
-            get_service(missing_id, db)
+            get_service(missing_id, db, User(id=uuid4(), email="missing@example.test", display_name="Missing", password_hash="x"))
         elif operation == "patch":
-            update_service(missing_id, ServiceUpdate.model_validate({"name": "Missing"}), db)
+            update_service(missing_id, ServiceUpdate.model_validate({"name": "Missing"}), db, User(id=uuid4(), email="missing@example.test", display_name="Missing", password_hash="x"))
         else:
-            delete_service(missing_id, db)
+            delete_service(missing_id, db, User(id=uuid4(), email="missing@example.test", display_name="Missing", password_hash="x"))
     assert error.value.status_code == 404
     assert error.value.detail == "Monitored service not found"
 
 
 def test_service_with_incident_history_cannot_be_deleted(test_db: sessionmaker, service_api_user: UUID) -> None:
     with test_db() as db:
-        service = create_service(ServiceCreate.model_validate(create_payload(service_api_user)), db)
+        service = create_service(ServiceCreate.model_validate(create_payload(service_api_user)), db, db.get(User, service_api_user))
         service_id = service.id
         db.add(Incident(service_id=service_id, title="Historical incident"))
         db.commit()
 
     with test_db() as db, pytest.raises(HTTPException) as error:
-        delete_service(service_id, db)
+        delete_service(service_id, db, db.get(User, service_api_user))
     assert error.value.status_code == 409
     assert error.value.detail == "This service has check or incident history and cannot be deleted"

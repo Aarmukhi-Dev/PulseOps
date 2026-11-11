@@ -148,6 +148,14 @@ def test_worker_validates_concurrency_limit() -> None:
         run_worker(threading.Event(), 0)
 
 
+def test_production_policy_prevents_worker_start(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "monitoring_worker_enabled", False)
+    with pytest.raises(SystemExit, match="disabled by deployment policy"):
+        worker.main()
+
+
 def test_worker_respects_concurrency_cap_and_waits_for_active_checks(monkeypatch) -> None:
     targets = [make_target() for _ in range(4)]
     monkeypatch.setattr(worker, "load_enabled_targets", lambda _factory: targets)

@@ -1,100 +1,118 @@
 import socket
-import urllib.error
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import pytest
 
-from app.monitoring.checks import CheckResult, ServiceTarget, check_http, check_service, check_tcp
+from app.monitoring.checks import (
+    CheckResult,
+    ServiceTarget,
+    _validated_addresses,
+    check_http,
+    check_service,
+    check_tcp,
+)
 
 
 def target(url: str, *, check_type: str = "http", expected_status_code: int | None = None) -> ServiceTarget:
-    return ServiceTarget(
-        service_id=uuid4(),
-        name="Mock service",
-        check_type=check_type,
-        target=url,
-        timeout_seconds=3,
-        check_interval_seconds=30,
-        expected_status_code=expected_status_code,
-    )
+    return ServiceTarget(uuid4(), "Mock service", check_type, url, 3, 30, expected_status_code)
+
+
+def dns_public(_host, _port, **_kwargs):
+    return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 443))]
+
+
+def response(status=200, location=None):
+    result = Mock()
+    result.status = status
+    result.getheader.return_value = location
+    result.close = Mock()
+    return result
 
 
 @pytest.mark.parametrize("url", ["http://service.example.test/health", "https://service.example.test/health"])
-def test_http_and_https_checks_use_timeout_and_mocked_response(url: str) -> None:
-    response = Mock()
-    response.status = 200
-    response.__enter__ = Mock(return_value=response)
-    response.__exit__ = Mock(return_value=False)
-
-    with patch("app.monitoring.checks.urllib.request.urlopen", return_value=response) as urlopen:
+def test_http_and_https_use_validated_pinned_addresses(url: str) -> None:
+    conn = Mock()
+    conn.getresponse.return_value = response()
+    with (
+        patch("app.monitoring.checks.socket.getaddrinfo", side_effect=dns_public),
+        patch("app.monitoring.checks._PinnedHTTPConnection", return_value=conn) as http_conn,
+        patch("app.monitoring.checks._PinnedHTTPSConnection", return_value=conn) as https_conn,
+    ):
         result = check_http(target(url))
-
-    assert result.is_available is True
-    assert result.status_code == 200
-    assert result.error_type is None
-    request = urlopen.call_args.args[0]
-    assert request.full_url == url
-    assert "Authorization" not in request.headers
-    assert urlopen.call_args.kwargs["timeout"] == 3
+    assert result == CheckResult(True, result.response_time_ms, 200, None)
+    (https_conn if url.startswith("https") else http_conn).assert_called_once_with(
+        "service.example.test", 443 if url.startswith("https") else 80, "93.184.216.34", socket.AF_INET, 3
+    )
+    assert conn.request.call_args.args[:2] == ("GET", "/health")
+    assert "Authorization" not in conn.request.call_args.kwargs["headers"]
 
 
 def test_expected_http_status_is_used() -> None:
-    response = Mock()
-    response.status = 204
-    response.__enter__ = Mock(return_value=response)
-    response.__exit__ = Mock(return_value=False)
-    with patch("app.monitoring.checks.urllib.request.urlopen", return_value=response):
+    conn = Mock()
+    conn.getresponse.return_value = response(204)
+    with patch("app.monitoring.checks._validated_addresses", return_value=[(socket.AF_INET, "93.184.216.34")]), patch(
+        "app.monitoring.checks._PinnedHTTPSConnection", return_value=conn
+    ):
         result = check_http(target("https://service.example.test", expected_status_code=204))
-    assert result.is_available is True
+    assert result.is_available and result.status_code == 204
 
 
-def test_http_error_is_recorded_without_reading_or_storing_its_body() -> None:
-    error = urllib.error.HTTPError("https://service.example.test", 503, "Unavailable", {}, None)
-    with patch("app.monitoring.checks.urllib.request.urlopen", side_effect=error):
-        result = check_http(target("https://service.example.test"))
-    assert result == CheckResult(False, result.response_time_ms, status_code=503, error_type="http_status")
+@pytest.mark.parametrize("url", ["http://127.0.0.1/", "http://localhost/", "https://user:secret@example.test/", "https://service.example.test/?api_key=private", "ftp://example.test/"])
+def test_invalid_or_local_http_targets_are_rejected_before_connect(url: str) -> None:
+    with patch("app.monitoring.checks._PinnedHTTPConnection") as connect, patch("app.monitoring.checks._PinnedHTTPSConnection") as connect_tls:
+        result = check_http(target(url))
+    assert not result.is_available and result.error_type == "invalid_target"
+    connect.assert_not_called()
+    connect_tls.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("exception", "expected_error"),
-    [(socket.timeout(), "timeout"), (urllib.error.URLError("connection refused"), "connection_error")],
-)
-def test_http_network_errors_become_unavailable_results(exception: Exception, expected_error: str) -> None:
-    with patch("app.monitoring.checks.urllib.request.urlopen", side_effect=exception):
-        result = check_http(target("https://service.example.test"))
-    assert result.is_available is False
-    assert result.error_type == expected_error
-    assert result.status_code is None
-    assert result.response_time_ms is not None
+@pytest.mark.parametrize("address", ["127.0.0.1", "10.0.0.2", "169.254.169.254", "192.168.1.2", "::1", "fe80::1"])
+def test_private_loopback_and_link_local_dns_results_are_rejected(address: str) -> None:
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    record = (family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, 443))
+    with patch("app.monitoring.checks.socket.getaddrinfo", return_value=[record]):
+        with pytest.raises(ValueError):
+            _validated_addresses("service.example.test", 443)
 
 
-def test_http_target_with_embedded_credentials_is_rejected_without_request() -> None:
-    with patch("app.monitoring.checks.urllib.request.urlopen") as urlopen:
-        result = check_http(target("https://user:secret@service.example.test/health"))
-    assert result == CheckResult(False, None, error_type="invalid_target")
-    urlopen.assert_not_called()
+def test_mixed_public_and_private_dns_answers_are_rejected() -> None:
+    public = dns_public("", 443)[0]
+    private = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.9", 443))
+    with patch("app.monitoring.checks.socket.getaddrinfo", return_value=[public, private]):
+        with pytest.raises(ValueError):
+            _validated_addresses("service.example.test", 443)
 
 
-def test_tcp_check_uses_mocked_connection_and_service_timeout() -> None:
-    connection = Mock()
-    connection.__enter__ = Mock(return_value=connection)
-    connection.__exit__ = Mock(return_value=False)
-    with patch("app.monitoring.checks.socket.create_connection", return_value=connection) as connect:
-        result = check_service(target("service.example.test:443", check_type="tcp"))
-    assert result.is_available is True
-    assert result.error_type is None
-    assert connect.call_args.args[0] == ("service.example.test", 443)
-    assert connect.call_args.kwargs["timeout"] == 3
+def test_http_redirect_revalidates_destination_and_blocks_private_hop() -> None:
+    conn = Mock()
+    conn.getresponse.return_value = response(302, "http://169.254.169.254/latest/meta-data/")
+    with (
+        patch("app.monitoring.checks._validated_addresses", side_effect=[[(socket.AF_INET, "93.184.216.34")], ValueError("private")]),
+        patch("app.monitoring.checks._PinnedHTTPConnection", return_value=conn),
+    ):
+        result = check_http(target("http://service.example.test/"))
+    assert not result.is_available and result.error_type == "invalid_target"
+    conn.request.assert_called_once()
 
 
-def test_tcp_timeout_is_reported_as_unavailable() -> None:
-    with patch("app.monitoring.checks.socket.create_connection", side_effect=socket.timeout()):
+def test_tcp_check_connects_to_pinned_public_ip() -> None:
+    sock = Mock()
+    with patch("app.monitoring.checks._validated_addresses", return_value=[(socket.AF_INET, "93.184.216.34")]), patch(
+        "app.monitoring.checks.socket.socket", return_value=sock
+    ) as make_socket:
         result = check_tcp(target("service.example.test:443", check_type="tcp"))
-    assert result.is_available is False
-    assert result.error_type == "timeout"
+    assert result.is_available
+    make_socket.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect.assert_called_once_with(("93.184.216.34", 443))
+
+
+def test_tcp_private_target_is_rejected_without_opening_socket() -> None:
+    with patch("app.monitoring.checks.socket.socket") as make_socket:
+        result = check_tcp(target("127.0.0.1:5432", check_type="tcp"))
+    assert not result.is_available and result.error_type == "invalid_target"
+    make_socket.assert_not_called()
 
 
 def test_unsupported_check_type_is_a_safe_failure() -> None:
-    result = check_service(target("anything", check_type="icmp"))
-    assert result == CheckResult(False, None, error_type="unsupported_check_type")
+    assert check_service(target("anything", check_type="icmp")) == CheckResult(False, None, error_type="unsupported_check_type")

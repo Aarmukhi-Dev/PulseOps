@@ -13,6 +13,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models import Incident, IncidentEvent, MonitoredService, ServiceCheck
 from app.monitoring.checks import CheckResult, ServiceTarget, check_service
@@ -265,6 +266,8 @@ def run_worker(
 
 
 def main() -> None:
+    if not settings.monitoring_worker_enabled:
+        raise SystemExit("Monitoring worker is disabled by deployment policy")
     parser = argparse.ArgumentParser(description="Monitor enabled PulseOps services.")
     parser.add_argument(
         "--max-concurrent-checks",

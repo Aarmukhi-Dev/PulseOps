@@ -5,8 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.auth import get_current_user
 from app.core.database import get_db
-from app.models import Incident, IncidentEvent, MonitoredService, ServiceCheck
+from app.models import Incident, IncidentEvent, MonitoredService, ServiceCheck, User
 from app.schemas.history import IncidentEventRead, IncidentRead, ServiceCheckRead
 
 router = APIRouter(tags=["monitoring history"])
@@ -17,8 +18,10 @@ def list_service_checks(
     service_id: UUID,
     limit: int = Query(default=48, ge=1, le=500),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> list[ServiceCheck]:
-    if db.get(MonitoredService, service_id) is None:
+    service = db.scalar(select(MonitoredService).where(MonitoredService.id == service_id, MonitoredService.created_by == user.id))
+    if service is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Monitored service not found")
     statement = (
         select(ServiceCheck)
@@ -34,8 +37,9 @@ def list_incidents(
     incident_status: Literal["open", "acknowledged", "resolved"] | None = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> list[IncidentRead]:
-    statement = select(Incident, MonitoredService.name).join(MonitoredService, Incident.service_id == MonitoredService.id)
+    statement = select(Incident, MonitoredService.name).join(MonitoredService, Incident.service_id == MonitoredService.id).where(MonitoredService.created_by == user.id)
     if incident_status is not None:
         statement = statement.where(Incident.status == incident_status)
     rows = db.execute(statement.order_by(Incident.started_at.desc(), Incident.id.desc()).limit(limit)).all()
@@ -63,8 +67,10 @@ def list_incident_events(
     incident_id: UUID,
     limit: int = Query(default=200, ge=1, le=500),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> list[IncidentEvent]:
-    if db.get(Incident, incident_id) is None:
+    incident = db.scalar(select(Incident).join(MonitoredService).where(Incident.id == incident_id, MonitoredService.created_by == user.id))
+    if incident is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
     statement = (
         select(IncidentEvent)
