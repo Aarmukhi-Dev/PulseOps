@@ -46,6 +46,15 @@ def test_neon_migration_url_must_be_direct() -> None:
         )
 
 
+@pytest.mark.parametrize("sslmode", ["disable", "allow", "prefer"])
+def test_neon_urls_reject_tls_downgrade_modes(sslmode: str) -> None:
+    with pytest.raises(ValidationError, match="sslmode"):
+        Settings(
+            _env_file=None,
+            database_url=f"postgresql://app_user:example-password@ep-prod-pooler.ap-southeast-1.aws.neon.tech/pulseops?sslmode={sslmode}",
+        )
+
+
 def test_local_database_url_and_explicit_cors_origins_are_supported() -> None:
     settings = Settings(
         _env_file=None,

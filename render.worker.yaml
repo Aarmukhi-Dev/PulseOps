@@ -1,0 +1,18 @@
+services:
+  - type: worker
+    name: pulseops-monitoring-worker
+    runtime: python
+    plan: starter
+    region: singapore
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.monitoring.worker
+    envVars:
+      - key: APP_ENV
+        value: worker
+      - key: DATABASE_URL
+        sync: false
+      - key: MONITORING_WORKER_ENABLED
+        value: "true"
+      - key: PULSEOPS_MAX_CONCURRENT_CHECKS
+        value: "10"

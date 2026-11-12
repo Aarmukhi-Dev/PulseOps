@@ -48,8 +48,12 @@ class Settings(BaseSettings):
             raise ValueError("DATABASE_URL must use PostgreSQL with psycopg 3")
 
         host = (url.host or "").lower()
-        if host.endswith(".neon.tech") and "sslmode" not in url.query:
-            url = url.update_query_dict({"sslmode": "require"})
+        if host.endswith(".neon.tech"):
+            sslmode = (url.query.get("sslmode") or "").lower()
+            if not sslmode:
+                url = url.update_query_dict({"sslmode": "require"})
+            elif sslmode not in {"require", "verify-ca", "verify-full"}:
+                raise ValueError("Neon PostgreSQL URLs must use sslmode=require, verify-ca, or verify-full")
         return url.render_as_string(hide_password=False)
 
     @field_validator("cors_origins")

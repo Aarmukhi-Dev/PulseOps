@@ -80,7 +80,8 @@ export type IncidentEvent = {
   created_at: string;
 };
 
-const apiBaseUrl = (import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/$/, "");
+const configuredApiBaseUrl = import.meta.env.VITE_API_URL?.trim();
+const apiBaseUrl = (configuredApiBaseUrl || (import.meta.env.DEV ? "http://localhost:8000" : "")).replace(/\/$/, "");
 
 export class ApiError extends Error {
   constructor(
@@ -93,6 +94,9 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  if (!apiBaseUrl) {
+    throw new ApiError("PulseOps API is not configured. Set VITE_API_URL in the hosting environment.", 0);
+  }
   let response: Response;
   try {
     response = await fetch(`${apiBaseUrl}${path}`, {

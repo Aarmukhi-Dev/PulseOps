@@ -62,7 +62,7 @@ For a production account, run `python -m app.cli.create_user` from a trusted ope
 
 ## Production deployment preparation
 
-This repository includes Render Blueprint and Vercel configuration for the existing FastAPI and Vite apps. The Render Blueprint intentionally omits the monitoring worker and keeps service mutations disabled, so the public deployment cannot create targets or trigger checks by default.
+This repository includes separate Render Blueprints for the FastAPI API and monitoring worker, plus Vercel configuration for the existing Vite app. The API requires login for service changes, and worker targets are restricted to public addresses with DNS pinning and redirect validation. Deploy the API first; only create the separate worker after migrations and the API health check succeed.
 
 ### Neon connection URLs
 
@@ -88,18 +88,19 @@ Create a **Blueprint** from the repository using root `render.yaml`, or create a
 | Start Command | `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
 | Health Check Path | `/health` |
 
-The Blueprint uses Render's paid Starter plan because Render only runs `preDeployCommand` on paid web services. Review the current Render price before creating it. The pre-deploy command applies the existing Alembic chain; the Blueprint does not start a worker. Keep `SERVICE_MUTATIONS_ENABLED=false` and `MONITORING_WORKER_ENABLED=false` for the public deployment.
+The Blueprint uses Render's paid Starter plan because Render only runs `preDeployCommand` on paid web services. Review current Render pricing before creating it. The pre-deploy command applies the existing Alembic chain. The API's `SERVICE_MUTATIONS_ENABLED=true` permits authenticated owners to manage their services; set it to `false` to make the dashboard read-only. The API process does not start a worker.
 
 Set these environment variables on the web service:
 
 - `DATABASE_URL`: Neon pooled URL.
 - `MIGRATION_DATABASE_URL`: Neon direct URL, used by the pre-deploy Alembic command.
-- `CORS_ORIGINS`: exact comma-separated production frontend origins, for example `https://your-project.vercel.app`. Add a custom frontend domain explicitly if used. Do not use `*` or a wildcard Vercel preview origin.
+- `CORS_ORIGINS`: set by the Blueprint to the exact existing production origin `https://pulse-theta-two.vercel.app`. Add a custom frontend domain explicitly if used. Do not use `*` or a wildcard Vercel preview origin.
 - `APP_ENV=production`.
 - `JWT_SECRET_KEY`: at least 32 random characters; generate a unique secret and store it only in Render's secret environment settings. Never reuse the local development secret.
 - `JWT_ACCESS_TOKEN_EXPIRE_MINUTES`: optional, defaults to 30 (allowed range 5–1440).
 - `API_RATE_LIMIT_PER_MINUTE` and `LOGIN_RATE_LIMIT_PER_MINUTE`: optional process-local request limits, defaults 120 and 5.
-- `SERVICE_MUTATIONS_ENABLED=false` and `MONITORING_WORKER_ENABLED=false`: keep these production safety switches disabled for the first public deployment.
+- `SERVICE_MUTATIONS_ENABLED=true`: authenticated owners can manage their own services; set this to `false` to disable service mutations.
+- `MONITORING_WORKER_ENABLED=false`: applies to the API environment only; the API process does not run the worker.
 - The optional `DATABASE_*` pool settings above, if you need to tune them.
 
 Before enabling automatic migrations, verify the target branch and the current Alembic revision. For a new empty Neon database, the pre-deploy command applies the existing chain through `0003_service_availability`. For a database with existing schema or data, confirm its revision and back it up before the first migration. Do not use the development-user CLI against Neon.
@@ -108,17 +109,11 @@ Render runs the pre-deploy command before the new service version starts. If the
 
 ### Render monitoring worker
 
-The deployment configuration intentionally does not create a **Background Worker**. If you later choose to run it, use root directory `backend`, build command `pip install -r requirements.txt`, and this start command:
-
-```text
-python -m app.monitoring.worker
-```
-
-Set `DATABASE_URL` to the same Neon pooled URL, `APP_ENV=worker`, and `MONITORING_WORKER_ENABLED=true` only after reviewing target restrictions and outbound network policy. Set `PULSEOPS_MAX_CONCURRENT_CHECKS` to the desired limit (default `10`). The worker does not need `JWT_SECRET_KEY`, `CORS_ORIGINS`, `MIGRATION_DATABASE_URL`, or a public port. Run exactly one worker instance until cross-instance scheduling coordination is implemented; multiple instances will independently schedule checks.
+After the API has deployed, `/health` returns 200, and the Neon migration is confirmed, create a second Render Blueprint from `render.worker.yaml`. This separate worker uses the existing entry point `python -m app.monitoring.worker`, receives the same Neon pooled `DATABASE_URL`, and sets `APP_ENV=worker`, `MONITORING_WORKER_ENABLED=true`, and `PULSEOPS_MAX_CONCURRENT_CHECKS=10`. Render prompts for the pooled URL in its dashboard; do not copy it into Git. The worker does not need `JWT_SECRET_KEY`, `CORS_ORIGINS`, `MIGRATION_DATABASE_URL`, or a public port. Run exactly one worker instance until cross-instance scheduling coordination is implemented; multiple instances will independently schedule checks.
 
 ### Vercel Vite frontend
 
-Create a Vercel project from the same repository with root directory `frontend`. The committed `frontend/vercel.json` configures Vite output, SPA route fallback, and browser security headers. Set `VITE_API_URL` in Vercel's Production environment to the Render API URL; it is public configuration, not a secret. Do not put database URLs, JWT keys, or passwords in any `VITE_*` variable.
+For the existing Vercel project, keep its production domain and set Root Directory to `frontend`. The committed `frontend/vercel.json` configures Vite output, SPA route fallback, and browser security headers. After Render assigns the API URL, set `VITE_API_URL` in Vercel's Production environment to that Render API origin; it is public configuration, not a secret. Do not put database URLs, JWT keys, or passwords in any `VITE_*` variable.
 
 Use these project settings:
 
