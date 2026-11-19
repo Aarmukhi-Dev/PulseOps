@@ -148,11 +148,176 @@ def test_worker_validates_concurrency_limit() -> None:
         run_worker(threading.Event(), 0)
 
 
+class FakeLockResult:
+    def __init__(self, value) -> None:
+        self.value = value
+
+    def scalar_one(self):
+        return self.value
+
+
+class FakeLockConnection:
+    def __init__(self, acquired: bool) -> None:
+        self.acquired = acquired
+        self.backend_pid = 1234
+        self.statements = []
+        self.closed = False
+
+    def execute(self, statement, params=None):
+        self.statements.append((str(statement), params))
+        if "pg_backend_pid" in str(statement):
+            return FakeLockResult(self.backend_pid)
+        return FakeLockResult(self.acquired if "try_advisory" in str(statement) else True)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeLockEngine:
+    def __init__(self, connection) -> None:
+        self.connection = connection
+        self.disposed = False
+
+    def connect(self):
+        return self.connection
+
+    def dispose(self):
+        self.disposed = True
+
+
+def test_worker_advisory_lock_acquisition_holds_direct_session(monkeypatch) -> None:
+    connection = FakeLockConnection(acquired=True)
+    engine = FakeLockEngine(connection)
+    factory_calls = []
+
+    def engine_factory(url, **kwargs):
+        factory_calls.append((url, kwargs))
+        return engine
+
+    monkeypatch.setattr(worker, "create_engine", engine_factory)
+    lock = worker.try_acquire_worker_lock("postgresql+psycopg://direct.example/db")
+
+    assert lock is not None
+    assert factory_calls[0][0].startswith("postgresql+psycopg://direct.example")
+    assert factory_calls[0][1]["poolclass"] is worker.NullPool
+    assert "pg_try_advisory_lock" in connection.statements[0][0]
+    assert not connection.closed and not engine.disposed
+    lock.assert_held()
+    assert "pg_backend_pid" in connection.statements[1][0]
+    lock.close()
+    assert "pg_advisory_unlock" in connection.statements[3][0]
+    assert connection.closed and engine.disposed
+
+
+def test_worker_lock_contention_closes_connection_without_owning_lock(monkeypatch) -> None:
+    connection = FakeLockConnection(acquired=False)
+    engine = FakeLockEngine(connection)
+    monkeypatch.setattr(worker, "create_engine", lambda *_args, **_kwargs: engine)
+
+    assert worker.try_acquire_worker_lock("postgresql+psycopg://direct.example/db") is None
+    assert connection.closed and engine.disposed
+    assert len(connection.statements) == 1
+
+
+def test_worker_waits_on_lock_contention_and_does_not_enter_check_loop(monkeypatch) -> None:
+    attempts = []
+
+    class StopAfterWait:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, _seconds):
+            self.stopped = True
+
+    stop_event = StopAfterWait()
+    assert worker.wait_for_worker_lock(
+        stop_event,
+        "direct-url",
+        retry_seconds=0,
+        lock_attempt=lambda _url: attempts.append(True) or None,
+    ) is None
+    assert len(attempts) == 1
+
+
+def test_worker_retries_lock_until_previous_deployment_releases_it() -> None:
+    connection = FakeLockConnection(acquired=True)
+    lock = worker.WorkerAdvisoryLock(FakeLockEngine(connection), connection, backend_pid=1234)
+    attempts = iter([None, lock])
+    calls = []
+
+    class StopAfterAcquisition:
+        def is_set(self):
+            return False
+
+        def wait(self, _seconds):
+            calls.append("waited")
+
+    acquired = worker.wait_for_worker_lock(
+        StopAfterAcquisition(),
+        "direct-url",
+        retry_seconds=0,
+        lock_attempt=lambda _url: next(attempts),
+    )
+    assert acquired is lock
+    assert calls == ["waited"]
+    lock.close()
+
+
+def test_worker_lock_connection_failure_is_propagated_for_supervised_restart(monkeypatch) -> None:
+    engine = FakeLockEngine(None)
+
+    def fail_to_connect():
+        raise RuntimeError("database unavailable")
+
+    engine.connect = fail_to_connect
+    monkeypatch.setattr(worker, "create_engine", lambda *_args, **_kwargs: engine)
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        worker.try_acquire_worker_lock("direct-url")
+    assert engine.disposed
+
+
+def test_worker_stops_scheduling_when_lock_session_changes(monkeypatch) -> None:
+    connection = FakeLockConnection(acquired=True)
+    lock = worker.WorkerAdvisoryLock(FakeLockEngine(connection), connection, backend_pid=1234)
+    connection.backend_pid = 5678
+    target_loads = []
+    monkeypatch.setattr(worker, "load_enabled_targets", lambda *_args: target_loads.append(True))
+
+    stop_event = threading.Event()
+    with pytest.raises(worker.WorkerLockLost, match="session changed"):
+        run_worker(stop_event, 1, lock_guard=lock)
+
+    assert stop_event.is_set()
+    assert target_loads == []
+
+
+def test_worker_main_does_not_check_services_while_lock_is_contended(monkeypatch) -> None:
+    monkeypatch.setattr(worker.settings, "monitoring_worker_enabled", True)
+    monkeypatch.setattr(worker.settings, "worker_lock_database_url", "postgresql+psycopg://direct/db")
+    monkeypatch.setattr(worker.argparse.ArgumentParser, "parse_args", lambda _self: SimpleNamespace(max_concurrent_checks=1))
+    monkeypatch.setattr(worker.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(worker, "wait_for_worker_lock", lambda *_args: None)
+    checks = []
+    monkeypatch.setattr(worker, "run_worker", lambda *_args: checks.append(True))
+
+    worker.main()
+    assert not checks
+
+
 def test_production_policy_prevents_worker_start(monkeypatch) -> None:
     from app.core.config import settings
 
     monkeypatch.setattr(settings, "monitoring_worker_enabled", False)
     with pytest.raises(SystemExit, match="disabled by deployment policy"):
+        worker.main()
+
+
+def test_worker_requires_lock_url_when_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(worker.settings, "monitoring_worker_enabled", True)
+    monkeypatch.setattr(worker.settings, "worker_lock_database_url", None)
+    with pytest.raises(SystemExit, match="WORKER_LOCK_DATABASE_URL is required"):
         worker.main()
 
 

@@ -29,6 +29,17 @@ def test_alembic_can_use_a_separate_direct_neon_url() -> None:
     assert make_url(settings.migration_database_url).drivername == "postgresql+psycopg"
 
 
+def test_worker_lock_url_uses_a_separate_direct_neon_endpoint() -> None:
+    settings = Settings(
+        _env_file=None,
+        database_url="postgresql://app_user:example-password@ep-prod-pooler.ap-southeast-1.aws.neon.tech/pulseops",
+        worker_lock_database_url="postgresql://app_user:example-password@ep-prod.ap-southeast-1.aws.neon.tech/pulseops",
+    )
+    assert make_url(settings.database_url).host.startswith("ep-prod-pooler")
+    assert make_url(settings.worker_lock_database_url).host == "ep-prod.ap-southeast-1.aws.neon.tech"
+    assert make_url(settings.worker_lock_database_url).query["sslmode"] == "require"
+
+
 def test_neon_application_url_must_be_pooled() -> None:
     with pytest.raises(ValidationError):
         Settings(
@@ -43,6 +54,15 @@ def test_neon_migration_url_must_be_direct() -> None:
             _env_file=None,
             database_url="postgresql://app_user:example-password@ep-prod-pooler.ap-southeast-1.aws.neon.tech/pulseops",
             migration_database_url="postgresql://migration_user:example-password@ep-prod-pooler.ap-southeast-1.aws.neon.tech/pulseops",
+        )
+
+
+def test_neon_worker_lock_url_must_be_direct() -> None:
+    with pytest.raises(ValidationError, match="WORKER_LOCK_DATABASE_URL"):
+        Settings(
+            _env_file=None,
+            database_url="postgresql://app_user:example-password@ep-prod-pooler.ap-southeast-1.aws.neon.tech/pulseops",
+            worker_lock_database_url="postgresql://app_user:example-password@ep-prod-pooler.ap-southeast-1.aws.neon.tech/pulseops",
         )
 
 

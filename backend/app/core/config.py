@@ -13,6 +13,7 @@ REPOSITORY_ROOT = BACKEND_ROOT.parent
 class Settings(BaseSettings):
     database_url: str
     migration_database_url: str | None = None
+    worker_lock_database_url: str | None = None
     cors_origins: str = "http://localhost:5173"
     app_env: str = "development"
     jwt_secret_key: str | None = None
@@ -33,7 +34,9 @@ class Settings(BaseSettings):
         hide_input_in_errors=True,
     )
 
-    @field_validator("database_url", "migration_database_url", mode="before")
+    @field_validator(
+        "database_url", "migration_database_url", "worker_lock_database_url", mode="before"
+    )
     @classmethod
     def normalize_postgres_url(cls, value: str | None) -> str | None:
         if value is None or not isinstance(value, str) or not value.strip():
@@ -107,6 +110,10 @@ class Settings(BaseSettings):
             migration_host = (make_url(self.migration_database_url).host or "").lower()
             if migration_host.endswith(".neon.tech") and "-pooler" in migration_host.split(".")[0]:
                 raise ValueError("MIGRATION_DATABASE_URL must use Neon's direct endpoint without -pooler")
+        if self.worker_lock_database_url:
+            lock_host = (make_url(self.worker_lock_database_url).host or "").lower()
+            if lock_host.endswith(".neon.tech") and "-pooler" in lock_host.split(".")[0]:
+                raise ValueError("WORKER_LOCK_DATABASE_URL must use Neon's direct endpoint without -pooler")
         return self
 
     @property

@@ -6,11 +6,14 @@ import signal
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Callable
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.pool import NullPool
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
@@ -21,6 +24,90 @@ from app.monitoring.checks import CheckResult, ServiceTarget, check_service
 logger = logging.getLogger("pulseops.monitoring")
 POLL_INTERVAL_SECONDS = 1.0
 ACTIVE_INCIDENT_STATUSES = ("open", "acknowledged")
+WORKER_ADVISORY_LOCK_KEY = 0x50554C53454F5053  # Stable application-wide PostgreSQL lock key.
+LOCK_RETRY_SECONDS = 2.0
+
+
+class WorkerLockLost(RuntimeError):
+    """Raised when the dedicated PostgreSQL session no longer owns the lock."""
+
+
+@dataclass
+class WorkerAdvisoryLock:
+    """Keep one direct PostgreSQL session open while this process owns the worker lock."""
+
+    engine: Engine
+    connection: Connection
+    backend_pid: int
+
+    def assert_held(self) -> None:
+        current_pid = int(self.connection.execute(text("SELECT pg_backend_pid()")).scalar_one())
+        if current_pid != self.backend_pid:
+            raise WorkerLockLost("monitoring advisory lock database session changed")
+
+    def close(self) -> None:
+        try:
+            self.connection.execute(
+                text("SELECT pg_advisory_unlock(:lock_key)"),
+                {"lock_key": WORKER_ADVISORY_LOCK_KEY},
+            )
+        except Exception as exc:
+            _log(logging.WARNING, "monitoring_lock_release_failed", exception_type=type(exc).__name__)
+        finally:
+            try:
+                self.connection.close()
+            finally:
+                self.engine.dispose()
+
+
+def try_acquire_worker_lock(database_url: str) -> WorkerAdvisoryLock | None:
+    """Try the singleton lock on a dedicated, non-pooled direct database session."""
+    lock_engine = create_engine(
+        database_url,
+        poolclass=NullPool,
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": settings.database_connect_timeout_seconds},
+    )
+    connection: Connection | None = None
+    try:
+        connection = lock_engine.connect()
+        acquired = bool(
+            connection.execute(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": WORKER_ADVISORY_LOCK_KEY},
+            ).scalar_one()
+        )
+        if acquired:
+            backend_pid = int(connection.execute(text("SELECT pg_backend_pid()")).scalar_one())
+            return WorkerAdvisoryLock(lock_engine, connection, backend_pid)
+        connection.close()
+        lock_engine.dispose()
+        return None
+    except Exception:
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            lock_engine.dispose()
+        raise
+
+
+def wait_for_worker_lock(
+    stop_event: threading.Event,
+    database_url: str,
+    retry_seconds: float = LOCK_RETRY_SECONDS,
+    lock_attempt: Callable[[str], WorkerAdvisoryLock | None] | None = None,
+) -> WorkerAdvisoryLock | None:
+    """Wait without checking services until this process owns the cross-deployment lock."""
+    acquire = lock_attempt or try_acquire_worker_lock
+    while not stop_event.is_set():
+        lock = acquire(database_url)
+        if lock is not None:
+            _log(logging.INFO, "monitoring_worker_lock_acquired")
+            return lock
+        _log(logging.INFO, "monitoring_worker_lock_contended", retry_seconds=retry_seconds)
+        stop_event.wait(retry_seconds)
+    return None
 
 
 def _log(level: int, event: str, **fields: object) -> None:
@@ -182,6 +269,7 @@ def run_worker(
     max_concurrent_checks: int,
     session_factory: sessionmaker[Session] = SessionLocal,
     check_function: Callable[[ServiceTarget], CheckResult] = check_service,
+    lock_guard: WorkerAdvisoryLock | None = None,
 ) -> None:
     if max_concurrent_checks < 1:
         raise ValueError("max_concurrent_checks must be at least 1")
@@ -194,6 +282,13 @@ def run_worker(
 
     try:
         while not stop_event.is_set():
+            if lock_guard is not None:
+                try:
+                    lock_guard.assert_held()
+                except Exception as exc:
+                    stop_event.set()
+                    _log(logging.CRITICAL, "monitoring_worker_lock_lost", exception_type=type(exc).__name__)
+                    raise
             try:
                 targets = load_enabled_targets(session_factory)
             except Exception as exc:
@@ -268,6 +363,8 @@ def run_worker(
 def main() -> None:
     if not settings.monitoring_worker_enabled:
         raise SystemExit("Monitoring worker is disabled by deployment policy")
+    if not settings.worker_lock_database_url:
+        raise SystemExit("WORKER_LOCK_DATABASE_URL is required when the monitoring worker is enabled")
     parser = argparse.ArgumentParser(description="Monitor enabled PulseOps services.")
     parser.add_argument(
         "--max-concurrent-checks",
@@ -288,7 +385,13 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
-    run_worker(stop_event, args.max_concurrent_checks)
+    lock = wait_for_worker_lock(stop_event, settings.worker_lock_database_url)
+    if lock is None:
+        return
+    try:
+        run_worker(stop_event, args.max_concurrent_checks, lock_guard=lock)
+    finally:
+        lock.close()
 
 
 if __name__ == "__main__":
