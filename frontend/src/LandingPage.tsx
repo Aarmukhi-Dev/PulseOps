@@ -30,8 +30,8 @@ export function LandingPage({ onNavigate }: LandingPageProps) {
           <a href="/incidents" onClick={(event) => { event.preventDefault(); navigate("/incidents"); }}>Incidents</a>
         </nav>
         <div className="landing-nav-actions">
-          <button className="landing-login" onClick={() => navigate("/dashboard")}>Log in</button>
-          <button className="landing-get-started" onClick={() => navigate("/dashboard")}>Get Started <span aria-hidden="true">↗</span></button>
+          <button className="landing-login" onClick={() => navigate("/login")}>Log in</button>
+          <button className="landing-get-started" onClick={() => navigate("/register")}>Get Started <span aria-hidden="true">↗</span></button>
         </div>
       </header>
 

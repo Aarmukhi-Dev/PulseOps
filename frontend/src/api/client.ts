@@ -38,6 +38,15 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void { una
 export async function login(email: string, password: string): Promise<{ access_token: string; user: AuthUser }> {
   return request("/api/auth/login", { method: "POST", body: JSON.stringify({ email, password }) });
 }
+export type RegistrationInput = {
+  display_name: string;
+  email: string;
+  password: string;
+  password_confirmation: string;
+};
+export async function registerAccount(input: RegistrationInput): Promise<{ access_token: string; user: AuthUser }> {
+  return request("/api/auth/register", { method: "POST", body: JSON.stringify(input) });
+}
 
 export type Metrics = {
   collected_at: string;
@@ -113,6 +122,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     try {
       const body = (await response.json()) as { detail?: unknown };
       if (typeof body.detail === "string") message = body.detail;
+      else if (Array.isArray(body.detail)) {
+        const firstMessage = body.detail.find((item): item is { msg: string } =>
+          typeof item === "object" && item !== null && "msg" in item && typeof item.msg === "string",
+        )?.msg;
+        if (firstMessage) message = firstMessage.replace(/^Value error,\s*/i, "");
+      }
     } catch {
       // Use the HTTP status message when the API response is not JSON.
     }

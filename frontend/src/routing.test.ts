@@ -6,6 +6,14 @@ describe("PulseOps routes", () => {
   });
 
   it.each([
+    ["/login", { kind: "login" }],
+    ["/register", { kind: "register" }],
+    ["/register/", { kind: "register" }],
+  ] as const)("recognizes the public authentication route %s", (path, route) => {
+    expect(routeFromPath(path)).toEqual(route);
+  });
+
+  it.each([
     ["/dashboard", "overview"],
     ["/dashboard/", "overview"],
     ["/services", "services"],

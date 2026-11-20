@@ -9,6 +9,7 @@ import {
   getServiceChecks,
   getServices,
   login,
+  registerAccount,
   setAccessToken,
   setUnauthorizedHandler,
   updateService,
@@ -58,14 +59,31 @@ export function App() {
     return () => setUnauthorizedHandler(null);
   }, []);
 
+  useEffect(() => {
+    if (authenticated && (route.kind === "login" || route.kind === "register")) navigate("/dashboard");
+  }, [authenticated, route, navigate]);
+
   async function handleLogin(email: string, password: string) {
     setAuthError("");
     try {
       const result = await login(email, password);
       setAccessToken(result.access_token);
       setAuthenticated(true);
+      if (route.kind !== "dashboard") navigate("/dashboard");
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Unable to log in.");
+    }
+  }
+
+  async function handleRegister(input: { display_name: string; email: string; password: string; password_confirmation: string }) {
+    setAuthError("");
+    try {
+      const result = await registerAccount(input);
+      setAccessToken(result.access_token);
+      setAuthenticated(true);
+      navigate("/dashboard");
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Unable to create your account.");
     }
   }
 
@@ -82,8 +100,11 @@ export function App() {
   }, [route]);
 
   if (route.kind === "landing") return <LandingPage onNavigate={navigate} />;
-  if (!authenticated) return <LoginPage error={authError} onLogin={handleLogin} onBack={() => navigate("/")} />;
-  return <DashboardApp initialPage={route.page} onNavigate={navigate} onLogout={handleLogout} />;
+  if (!authenticated && route.kind === "register") {
+    return <CreateAccountPage error={authError} onRegister={handleRegister} onLogin={() => navigate("/login")} onBack={() => navigate("/")} />;
+  }
+  if (!authenticated) return <LoginPage error={authError} onLogin={handleLogin} onBack={() => navigate("/")} onCreateAccount={() => navigate("/register")} />;
+  return <DashboardApp initialPage={route.kind === "dashboard" ? route.page : "overview"} onNavigate={navigate} onLogout={handleLogout} />;
 }
 
 function DashboardApp({ initialPage, onNavigate, onLogout }: { initialPage: Page; onNavigate: (path: string) => void; onLogout: () => void }) {
@@ -260,7 +281,7 @@ function DashboardApp({ initialPage, onNavigate, onLogout }: { initialPage: Page
   );
 }
 
-function LoginPage({ error, onLogin, onBack }: { error: string; onLogin: (email: string, password: string) => Promise<void>; onBack: () => void }) {
+function LoginPage({ error, onLogin, onBack, onCreateAccount }: { error: string; onLogin: (email: string, password: string) => Promise<void>; onBack: () => void; onCreateAccount: () => void }) {
   const [busy, setBusy] = useState(false);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -269,7 +290,31 @@ function LoginPage({ error, onLogin, onBack }: { error: string; onLogin: (email:
     try { await onLogin(String(data.get("email")), String(data.get("password"))); }
     finally { setBusy(false); }
   }
-  return <main className="auth-page"><section className="auth-card glass-panel"><a className="brand auth-brand" href="/" onClick={(event) => { event.preventDefault(); onBack(); }}><span className="brand-mark">P</span><span>pulse<span className="brand-light">ops</span><small>OPERATIONS CENTER</small></span></a><div className="eyebrow">SECURE WORKSPACE</div><h1>Welcome back</h1><p>Sign in to access your monitored services and incident history.</p><form onSubmit={(event) => void submit(event)}><label>Email<input name="email" type="email" autoComplete="username" maxLength={320} required /></label><label>Password<input name="password" type="password" autoComplete="current-password" maxLength={1024} required /></label>{error && <div className="auth-error" role="alert">{error}</div>}<button className="primary-button" disabled={busy}>{busy ? "Signing in…" : "Log in"}</button></form><button className="auth-back" onClick={onBack}>← Back to PulseOps</button></section></main>;
+  return <main className="auth-page"><section className="auth-card glass-panel"><a className="brand auth-brand" href="/" onClick={(event) => { event.preventDefault(); onBack(); }}><span className="brand-mark">P</span><span>pulse<span className="brand-light">ops</span><small>OPERATIONS CENTER</small></span></a><div className="eyebrow">SECURE WORKSPACE</div><h1>Welcome back</h1><p>Sign in to access your monitored services and incident history.</p><form onSubmit={(event) => void submit(event)}><label>Email<input name="email" type="email" autoComplete="username" maxLength={320} required /></label><label>Password<input name="password" type="password" autoComplete="current-password" maxLength={1024} required /></label>{error && <div className="auth-error" role="alert">{error}</div>}<button className="primary-button" disabled={busy}>{busy ? "Signing in…" : "Log in"}</button></form><button className="auth-back auth-switch" onClick={onCreateAccount}>New to PulseOps? Create an account</button><button className="auth-back" onClick={onBack}>← Back to PulseOps</button></section></main>;
+}
+
+function CreateAccountPage({ error, onRegister, onLogin, onBack }: {
+  error: string;
+  onRegister: (input: { display_name: string; email: string; password: string; password_confirmation: string }) => Promise<void>;
+  onLogin: () => void;
+  onBack: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    setBusy(true);
+    try {
+      await onRegister({
+        display_name: String(data.get("display_name")),
+        email: String(data.get("email")),
+        password: String(data.get("password")),
+        password_confirmation: String(data.get("password_confirmation")),
+      });
+    } finally { setBusy(false); }
+  }
+
+  return <main className="auth-page"><section className="auth-card register-card glass-panel"><a className="brand auth-brand" href="/" onClick={(event) => { event.preventDefault(); onBack(); }}><span className="brand-mark">P</span><span>pulse<span className="brand-light">ops</span><small>OPERATIONS CENTER</small></span></a><div className="eyebrow">YOUR INFRASTRUCTURE, IN FOCUS</div><h1>Create your account</h1><p>Set up your PulseOps workspace and start monitoring with clarity.</p><form onSubmit={(event) => void submit(event)}><label>Display name<input name="display_name" type="text" autoComplete="name" minLength={1} maxLength={120} required /></label><label>Email<input name="email" type="email" autoComplete="email" maxLength={320} required /></label><label>Password<input name="password" type="password" autoComplete="new-password" minLength={12} maxLength={1024} required /><small className="auth-hint">Use at least 12 characters.</small></label><label>Confirm password<input name="password_confirmation" type="password" autoComplete="new-password" minLength={12} maxLength={1024} required /></label>{error && <div className="auth-error" role="alert">{error}</div>}<button className="primary-button" disabled={busy}>{busy ? "Creating account…" : "Create account"}</button></form><button className="auth-back auth-switch" onClick={onLogin}>Already have an account? Log in</button><button className="auth-back" onClick={onBack}>← Back to PulseOps</button></section></main>;
 }
 
 function StatCard({ label, value, sub, icon, tone }: { label: string; value: number; sub: string; icon: string; tone: string }) {

@@ -41,6 +41,11 @@ def _verify_password(password: str, hashed: str) -> bool:
         return False
 
 
+def hash_password(password: str) -> str:
+    """Hash a raw password with the application's configured password hasher."""
+    return _password_hash.hash(password)
+
+
 def authenticate_user(email: str, password: str, db: Session) -> User | None:
     normalized_email = email.strip().lower()
     user = db.scalar(select(User).where(User.email == normalized_email))

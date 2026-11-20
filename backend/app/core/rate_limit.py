@@ -37,7 +37,7 @@ class LocalRateLimitMiddleware:
                 return
         client = scope.get("client")
         peer = client[0] if client else "unknown"
-        category = "login" if path == "/api/auth/login" else "api"
+        category = "login" if path in {"/api/auth/login", "/api/auth/register"} else "api"
         limit = settings.login_rate_limit_per_minute if category == "login" else settings.api_rate_limit_per_minute
         now = monotonic()
         key = (category, peer)
